@@ -53,10 +53,11 @@ def _mixup(mixup_modules, alpha, batch_size):
 
 class Trainer(object):
 
-    def __init__(self, model, criterion, optimizer=None,
+    def __init__(self, model, criterion, optimizer=None, calc_grad_var=None,
                  device_ids=[0], device=torch.cuda, dtype=torch.float,
-                 distributed=False, local_rank=-1, adapt_grad_norm=None,
-                 mixup=None, cutmix=None, loss_scale=1., grad_clip=-1, print_freq=100):
+                 distributed=False, local_rank=-1, adapt_grad_norm=None, 
+                 mixup=None, cutmix=None, loss_scale=1., grad_clip=-1, print_freq=100,
+                 batch_size=64):
         self._model = model
         self.criterion = criterion
         self.epoch = 0
@@ -70,9 +71,11 @@ class Trainer(object):
         self.grad_clip = grad_clip
         self.mixup = mixup
         self.cutmix = cutmix
+        self.batch_size = batch_size
         self.grad_scale = None
         self.loss_scale = loss_scale
         self.adapt_grad_norm = adapt_grad_norm
+        self.calc_grad_var = calc_grad_var
         self.watcher = None
         self.streams = {}
 
@@ -129,7 +132,7 @@ class Trainer(object):
                     inputs = input_mixup(inputs)
 
             # compute output
-            output = self.model(inputs)
+            output, _ = self.model(inputs)
 
             if mixup is not None:
                 target = mixup.mix_target(target, output.size(-1))
@@ -418,7 +421,7 @@ class SelectionTrainer(Trainer):
             meters['data'].update(time.time() - end)
 
             
-            inputs, target = self.select_1st_2nd_smallest(inputs, target, meters)
+            inputs, target = self.select_mms(inputs, target, meters)
             
 
             output, loss, grad = self._step(inputs, target,

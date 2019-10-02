@@ -19,7 +19,7 @@ from utils.misc import torch_dtypes
 from utils.param_filter import FilterModules, is_bn
 from datetime import datetime
 from ast import literal_eval
-from trainer import Trainer, SelectionTrainer, LabelSelectTrainer, HardNegativeTrainer, NMAugmentTrainer
+from trainer import Trainer, SelectionTrainer, HardNegativeTrainer
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -32,7 +32,7 @@ parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
-parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='/media/Datasets',
+parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='/home/toky/Datasets',
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
@@ -258,24 +258,8 @@ def main_worker(args):
                                    grad_clip=args.grad_clip, print_freq=args.print_freq,
                                    adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
                                    calc_grad_var=args.calc_grad_var)
-    elif 'label_select' in model_config['regime']:
-        trainer = LabelSelectTrainer(model, criterion, optimizer,
-                                     device_ids=args.device_ids, device=args.device, dtype=dtype,
-                                     distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
-                                     loss_scale=args.loss_scale,
-                                     grad_clip=args.grad_clip, print_freq=args.print_freq,
-                                     adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
-                                     calc_grad_var=args.calc_grad_var)
     elif 'hard_select' in model_config['regime']:
         trainer = HardNegativeTrainer(model, criterion, optimizer,
-                                     device_ids=args.device_ids, device=args.device, dtype=dtype,
-                                     distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
-                                     loss_scale=args.loss_scale,
-                                     grad_clip=args.grad_clip, print_freq=args.print_freq,
-                                     adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
-                                     calc_grad_var=args.calc_grad_var)
-    elif 'augment_select' in model_config['regime']:
-        trainer = NMAugmentTrainer(model, criterion, optimizer,
                                      device_ids=args.device_ids, device=args.device, dtype=dtype,
                                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
                                      loss_scale=args.loss_scale,

@@ -8,11 +8,74 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from utils.mixup import MixUp
+from scipy.stats import ortho_group
+from torch.autograd import Variable
+import numpy as np
+import random
 
 __all__ = ['resnet', 'resnet_se']
 
 
-def init_model(model):
+def create_max_span_matrix(n, m):
+    mat = torch.zeros((n, m))
+    for i in range(n):
+        row = torch.ones((1, m)).normal_(0., 0.1)
+        row /= row.sum()
+        mat[i][:] = row
+    return mat
+
+class OrthNormalProj(nn.Module):
+
+    def __init__(self, input_size, output_size, bias=True, fixed_weights=True, fixed_scale=None):
+        super(OrthNormalProj, self).__init__()
+        self.output_size = output_size
+        self.input_size = input_size
+        mat = torch.from_numpy(ortho_group.rvs(dim=input_size)).float()[:output_size]
+        # mat = torch.cat((mat, -mat))
+        # pos = torch.eye(input_size)
+        # neg = -torch.eye(input_size)
+        mat = torch.cat((mat[:output_size // 2], -mat[:output_size // 2]))
+        # mat = create_max_span_matrix(output_size, input_size)
+        if fixed_weights:
+            self.proj = Variable(mat, requires_grad=False)
+        else:
+            self.proj = nn.Parameter(mat)
+
+        init_scale = 1. / math.sqrt(self.output_size)
+
+        if fixed_scale is not None:
+            self.scale = Variable(torch.Tensor(
+                [fixed_scale]), requires_grad=False)
+        else:
+            self.scale = nn.Parameter(torch.Tensor([init_scale]))
+
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(
+                output_size).uniform_(-init_scale, init_scale))
+        else:
+            self.register_parameter('bias', None)
+
+        self.eps = 1e-8
+
+    def forward(self, x):
+        if not isinstance(self.scale, nn.Parameter):
+            self.scale = self.scale.type_as(x)
+        # x = x / (x.norm(2, -1, keepdim=True) + self.eps)
+        w = self.proj.type_as(x)
+
+        out = -self.scale * nn.functional.linear(x, w)
+        if self.bias is not None:
+            out = out + self.bias.view(1, -1)
+        return out
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, bias=False):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, groups=groups, bias=bias)
+
+
+def init_model(model, init_fc=True):
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
             n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -25,9 +88,9 @@ def init_model(model):
             nn.init.constant_(m.bn3.weight, 0)
         elif isinstance(m, BasicBlock):
             nn.init.constant_(m.bn2.weight, 0)
-
-    model.fc.weight.data.normal_(0, 0.01)
-    model.fc.bias.data.zero_()
+    if init_fc:
+        model.fc.weight.data.normal_(0, 0.01)
+        model.fc.bias.data.zero_()
 
 
 def weight_decay_config(value=1e-4, log=False):
@@ -37,44 +100,6 @@ def weight_decay_config(value=1e-4, log=False):
             'filter': {'parameter_name': lambda n: not n.endswith('bias'),
                        'module': lambda m: not isinstance(m, nn.BatchNorm2d)}
             }
-
-
-def mixsize_config(sz, base_size, base_batch, base_duplicates, adapt_batch, adapt_duplicates):
-    assert adapt_batch or adapt_duplicates or sz == base_size
-    batch_size = base_batch
-    duplicates = base_duplicates
-    if adapt_batch and adapt_duplicates:
-        scale = base_size/sz
-    else:
-        scale = (base_size/sz)**2
-
-    if scale * duplicates < 0.5:
-        adapt_duplicates = False
-        adapt_batch = True
-
-    if adapt_batch:
-        batch_size = int(round(scale * base_batch))
-
-    if adapt_duplicates:
-        duplicates = int(round(scale * duplicates))
-
-    duplicates = max(1, duplicates)
-    return {
-        'input_size': sz,
-        'batch_size': batch_size,
-        'duplicates': duplicates
-    }
-
-
-def ramp_up_fn(lr0, lrT, T):
-    rate = (lrT - lr0) / T
-    return "lambda t: {'lr': %s + t * %s}" % (lr0, rate)
-
-
-def conv3x3(in_planes, out_planes, stride=1, groups=1, bias=False):
-    "3x3 convolution with padding"
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, groups=groups, bias=bias)
 
 
 class BasicBlock(nn.Module):
@@ -207,21 +232,57 @@ class ResNet(nn.Module):
         return x.view(x.size(0), -1)
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.fc(x)
-        return x
+        features = self.features(x)
+
+        if hasattr(self, 'orth') and not hasattr(self, 'fc'):
+            if (self.orth.proj.data.shape[-1] > features.data.shape[-1]):
+                features = torch.cat((features, torch.ones((features.size(0), 1)).to(device=features.device)),
+                                     dim=1)
+            x = features
+        else:
+            if (self.fc.weight.data.shape[-1] > features.data.shape[-1]):
+                features = torch.cat((features, torch.ones((features.size(0), 1)).to(device=features.device)),
+                                     dim=1)
+            x = self.fc(features)
+        if hasattr(self, 'orth'):
+            y = self.orth(x)
+        else:
+            y = x
+        mz_loss = None
+        if 'mz_mean' in self.regime_name:
+            mz_loss = 0.1 * torch.mean((torch.norm(features, dim=1) - 10)**2)
+        elif 'mz_all_mean' in self.regime_name:
+            mz_loss = (torch.mean(torch.norm(features, dim=1)) - 10)**2
+        elif 'mz_relu' in self.regime_name:
+            mz_loss = torch.mean(nn.ReLU()(10 - torch.norm(features, dim=1)))
+
+        # if 'mz_eye' in self.regime_name:
+        #     orth_proj = self.orth.proj.matmul(self.orth.proj.t())
+        #     if mz_loss is not None:
+        #         mz_loss += nn.MSELoss()(orth_proj, torch.eye(orth_proj.shape[-1])).to(device=orth_proj.device)
+        #     else:
+        #         mz_loss = nn.MSELoss()(orth_proj, torch.eye(orth_proj.shape[-1]).to(device=orth_proj.device))
+        if 'mz_orth_eye' in self.regime_name and hasattr(self, 'fc'):
+            orth_proj = self.fc.weight.matmul(self.fc.weight.t())
+            # orth_proj = self.orth.proj.matmul(self.orth.proj.t())
+            if mz_loss is not None:
+                mz_loss += nn.MSELoss()(orth_proj, torch.eye(orth_proj.shape[-1])).to(device=orth_proj.device)
+            else:
+                mz_loss = nn.MSELoss()(orth_proj, torch.eye(orth_proj.shape[-1]).to(device=orth_proj.device))
+
+        return y, mz_loss
 
 
 class ResNet_imagenet(ResNet):
-    num_train_images = 1281167
 
     def __init__(self, num_classes=1000, inplanes=64,
                  block=Bottleneck, residual_block=None, layers=[3, 4, 23, 3],
                  width=[64, 128, 256, 512], expansion=4, groups=[1, 1, 1, 1],
-                 regime='normal', scale_lr=1, ramp_up_lr=True, checkpoint_segments=0, mixup=False,
-                 base_devices=4, base_device_batch=64, base_duplicates=1, base_image_size=224, mix_size_regime='D+'):
+                 regime='normal', scale_lr=1, checkpoint_segments=0, mixup=False):
         super(ResNet_imagenet, self).__init__()
         self.inplanes = inplanes
+        self.num_classes = num_classes
+        self.regime_name = regime
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = nn.BatchNorm2d(self.inplanes)
@@ -238,68 +299,68 @@ class ResNet_imagenet(ResNet):
             setattr(self, 'layer%s' % str(i + 1), layer)
 
         self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(width[-1] * expansion, num_classes)
+        init_fc = True
+        if 'BMz' in regime:
+            self.fc = nn.Linear(width[-1] * expansion + 1, width[-1] * expansion, bias=False)
+            self.fc.weight.data.normal_(0, 0.01)
+            self.fc.weight.data[:, width[-1]].zero_()
+            self.orth = OrthNormalProj(width[-1] * expansion, self.num_classes, bias=False)
+            init_fc = False
+        elif 'mz_orth' in regime:
+            self.orth = OrthNormalProj(width[-1] * expansion + 1, self.num_classes, fixed_weights=True, bias=False)
+            init_fc = False
+        else:
+            self.fc = nn.Linear(width[-1] * expansion, num_classes)
 
-        init_model(self)
-        batch_size = base_devices * base_device_batch
-        num_steps_epoch = math.floor(self.num_train_images / batch_size)
+        init_model(self, init_fc)
 
-        # base regime
-        self.regime = [
-            {'epoch': 0, 'optimizer': 'SGD', 'lr': scale_lr * 1e-1,
-             'momentum': 0.9, 'regularizer': weight_decay_config(1e-4)},
-            {'epoch': 30, 'lr': scale_lr * 1e-2},
-            {'epoch': 60, 'lr': scale_lr * 1e-3},
-            {'epoch': 80, 'lr': scale_lr * 1e-4}
-        ]
-
-        if 'cutmix' in regime:
+        def ramp_up_lr(lr0, lrT, T):
+            rate = (lrT - lr0) / T
+            return "lambda t: {'lr': %s + t * %s}" % (lr0, rate)
+        if regime == 'normal':
             self.regime = [
-                {'epoch': 0, 'optimizer': 'SGD', 'lr': scale_lr * 1e-1,
-                 'momentum': 0.9, 'regularizer': weight_decay_config(1e-4)},
-                {'epoch': 75, 'lr': scale_lr * 1e-2},
-                {'epoch': 150, 'lr': scale_lr * 1e-3},
-                {'epoch': 225, 'lr': scale_lr * 1e-4}
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'regularizer': weight_decay_config(1e-4),
+                 'step_lambda': ramp_up_lr(0.1, 0.1 * scale_lr, 5004 * 5 / scale_lr)},
+                {'epoch': 5,  'lr': scale_lr * 1e-1},
+                {'epoch': 30, 'lr': scale_lr * 1e-2},
+                {'epoch': 60, 'lr': scale_lr * 1e-3},
+                {'epoch': 80, 'lr': scale_lr * 1e-4}
             ]
-
-        # Sampled regimes from "Mix & Match: training convnets with mixed image sizes for improved accuracy, speed and scale resiliency"
-        if 'sampled' in regime:
-            # add gradient smoothing
-            self.regime[0]['regularizer'] = [{'name': 'GradSmooth', 'momentum': 0.9, 'log': False},
-                                             weight_decay_config(1e-4)]
-            ramp_up_lr = False
-            self.data_regime = None
-
-            def size_config(size): return mixsize_config(size, base_size=base_image_size, base_batch=base_device_batch, base_duplicates=base_duplicates,
-                                                         adapt_batch=mix_size_regime == 'B+', adapt_duplicates=mix_size_regime == 'D+')
-            increment = int(base_image_size / 7)
-
-            if '144' in regime:
-                self.sampled_data_regime = [
-                    (0.1, size_config(base_image_size+increment)),
-                    (0.1, size_config(base_image_size)),
-                    (0.6, size_config(base_image_size - 3*increment)),
-                    (0.2, size_config(base_image_size - 4*increment)),
-                ]
-            else:  # sampled-224
-                self.sampled_data_regime = [
-                    (0.8/6, size_config(base_image_size - 3*increment)),
-                    (0.8/6, size_config(base_image_size - 2*increment)),
-                    (0.8/6, size_config(base_image_size - increment)),
-                    (0.2, size_config(base_image_size)),
-                    (0.8/6, size_config(base_image_size + increment)),
-                    (0.8/6, size_config(base_image_size + 2*increment)),
-                    (0.8/6, size_config(base_image_size + 3*increment)),
-                ]
-
+        elif regime == 'fast':
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'momentum': 0.9, 'regularizer': weight_decay_config(1e-4),
+                 'step_lambda': ramp_up_lr(0.1, 0.1 * 4 * scale_lr, 5004 * 4 / (4 * scale_lr))},
+                {'epoch': 4,  'lr': 4 * scale_lr * 1e-1},
+                {'epoch': 18, 'lr': scale_lr * 1e-1},
+                {'epoch': 21, 'lr': scale_lr * 1e-2},
+                {'epoch': 35, 'lr': scale_lr * 1e-3},
+                {'epoch': 43, 'lr': scale_lr * 1e-4},
+            ]
+            self.data_regime = [
+                {'epoch': 0, 'input_size': 128, 'batch_size': 256},
+                {'epoch': 18, 'input_size': 224, 'batch_size': 64},
+                {'epoch': 41, 'input_size': 288, 'batch_size': 32},
+            ]
+        elif 'small' in regime:
+            if regime == 'small_half':
+                bs_factor = 2
+            else:
+                bs_factor = 1
+            scale_lr *= 4 * bs_factor
+            self.regime = [
+                {'epoch': 0, 'optimizer': 'SGD', 'regularizer': weight_decay_config(1e-4),
+                 'momentum': 0.9, 'lr': scale_lr * 1e-1},
+                {'epoch': 30, 'lr': scale_lr * 1e-2},
+                {'epoch': 60, 'lr': scale_lr * 1e-3},
+                {'epoch': 80, 'lr': bs_factor * 1e-4}
+            ]
+            self.data_regime = [
+                {'epoch': 0, 'input_size': 128, 'batch_size': 256 * bs_factor},
+                {'epoch': 80, 'input_size': 224, 'batch_size': 64 * bs_factor},
+            ]
             self.data_eval_regime = [
-                {'epoch': 0, 'input_size': base_image_size}
+                {'epoch': 0, 'input_size': 224, 'batch_size': 512 * bs_factor},
             ]
-
-        if ramp_up_lr and scale_lr > 1:  # add learning rate ramp-up
-            self.regime[0]['step_lambda'] = ramp_up_fn(0.1, 0.1 * scale_lr,
-                                                       num_steps_epoch * 5)
-            self.regime.insert(1, {'epoch': 5,  'lr': scale_lr * 1e-1})
 
 
 class ResNet_cifar(ResNet):
@@ -309,6 +370,8 @@ class ResNet_cifar(ResNet):
                  groups=[1, 1, 1], residual_block=None, regime='normal', dropout=None, mixup=False):
         super(ResNet_cifar, self).__init__()
         self.inplanes = inplanes
+        self.num_classes = num_classes
+        self.regime_name = regime
         n = int((depth - 2) / 6)
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1,
                                bias=False)
@@ -324,24 +387,84 @@ class ResNet_cifar(ResNet):
             block, width[2], n, stride=2, groups=groups[2], residual_block=residual_block, dropout=dropout, mixup=mixup)
         self.layer4 = lambda x: x
         self.avgpool = nn.AvgPool2d(8)
-        self.fc = nn.Linear(width[-1], num_classes)
+        init_fc = True
+        if 'BMz' in regime:
+            self.fc = nn.Linear(width[-1]+1, width[-1], bias=False)
+            self.fc.weight.data.normal_(0, 0.01)
+            self.fc.weight.data[:, width[-1]].zero_()
+            self.orth = OrthNormalProj(width[-1], self.num_classes, bias=False)
+            init_fc = False
+        elif 'QAz' in regime:
+            self.fc = nn.Linear(width[-1]+1, self.num_classes, bias=False)
+            self.fc.weight.data.normal_(0, 0.01)
+            self.fc.weight.data[:, width[-1]].zero_()
+            self.orth = OrthNormalProj(self.num_classes, self.num_classes, bias=False)
+            init_fc = False
+        elif 'mz_orth' in regime:
+            if 'eye' in regime:
+                self.fc = nn.Linear(width[-1] + 1, width[-1], bias=False)
+                self.fc.weight.data = torch.from_numpy(ortho_group.rvs(dim=width[-1] + 1)).float()[:width[-1]]
+                # self.fc.weight.data.normal_(0, 0.01)
+                # self.fc.weight.data[:, width[-1]].zero_()
+                self.orth = OrthNormalProj(width[-1], self.num_classes, fixed_weights=True, bias=False)
+            else:
+                self.orth = OrthNormalProj(width[-1] + 1, self.num_classes, fixed_weights=True, bias=False)
+            init_fc = False
+        else:
+            # self.fc = nn.Linear(width[-1] + 1, self.num_classes, bias=False)
+            # pos = torch.eye(width[-1] + 1)
+            # neg = -torch.eye(width[-1] + 1)
+            # self.fc.weight.data = torch.cat((pos[:self.num_classes//2], neg[:self.num_classes//2]))
+            # self.fc.weight.requires_grad = False
+            # init_fc = False
+            # self.fc = nn.Linear(width[-1], self.num_classes)
+            self.fc = nn.Linear(width[-1] + 1, num_classes, bias=False)
+            self.fc.weight.data.normal_(0, 0.01)
+            self.fc.weight.data[:, width[-1]].zero_()
+            init_fc = False
 
-        init_model(self)
-        if regime == 'normal':
+        init_model(self, init_fc)
+
+        if 'normal' in regime:
             self.regime = [
                 {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1, 'momentum': 0.9,
                  'regularizer': weight_decay_config(1e-4)},
-                {'epoch': 81, 'lr': 1e-2},
-                {'epoch': 122, 'lr': 1e-3},
-                {'epoch': 164, 'lr': 1e-4}
+                # {'epoch': 81, 'lr': 1e-2},
+                # {'epoch': 122, 'lr': 1e-3},
+                # {'epoch': 164, 'lr': 1e-4}
+                #{'step': 63260, 'lr': 1e-2},
+                #{'step': 95282, 'lr': 1e-3},
+                #{'step': 128084, 'lr': 1e-4}
+                # {'step': 19525, 'lr': 1e-2},
+                 {'step': 24992, 'lr': 1e-2},
+                 {'step': 27335, 'lr': 1e-3},
+                 {'step': 29678, 'lr': 1e-4}
+                # {'step': 14058, 'lr': 1e-2},
+                # {'step': 13277, 'lr': 1e-2},
+                # {'step': 24211, 'lr': 1e-2},
+                # {'step': 15620, 'lr': 1e-3},
+                # {'step': 35926, 'lr': 1e-3},
+                # {'step': 36707, 'lr': 1e-4}
             ]
-        elif regime == 'wide-resnet':
+        elif 'wide-resnet' in regime:
             self.regime = [
                 {'epoch': 0, 'optimizer': 'SGD', 'lr': 1e-1, 'momentum': 0.9,
                  'regularizer': weight_decay_config(5e-4)},
-                {'epoch': 60, 'lr': 2e-2},
-                {'epoch': 120, 'lr': 4e-3},
-                {'epoch': 160, 'lr': 8e-4}
+                # {'epoch': 60, 'lr': 2e-2},
+                # {'epoch': 120, 'lr': 4e-3},
+                # {'epoch': 160, 'lr': 8e-4}
+                # {'step': 46860, 'lr': 2e-2},
+                # {'step': 93720, 'lr': 4e-3},
+                # {'step': 124960, 'lr': 8e-4}
+                # {'step': 22700, 'lr': 2e-2},
+                # {'step': 69700, 'lr': 4e-3},
+                # {'step': 100960, 'lr': 8e-4}
+                # {'step': 23430, 'lr': 4e-3},
+                # {'step': 46860, 'lr': 8e-4},
+                # {'step': 62480, 'lr': 1.6e-5}
+                {'step': 39050, 'lr': 2e-2},
+                {'step': 41393, 'lr': 4e-3},
+                {'step': 43736, 'lr': 8e-4}
             ]
 
 
